@@ -169,6 +169,12 @@ static jbyteArray createInetSocketAddressArray(JNIEnv* env, const struct sockadd
     return bArray;
 }
 
+
+static int netty_unix_socket_setOption0(jint fd, int level, int optname, const void* optval, socklen_t len) {
+    return setsockopt(fd, level, optname, optval, len);
+}
+
+
 static int socket_type(JNIEnv* env) {
     jboolean ipv4Preferred = (*env)->CallStaticBooleanMethod(env, netUtilClass, netUtilClassIpv4PreferredMethodId);
 
@@ -183,6 +189,27 @@ static int socket_type(JNIEnv* env) {
         }
         return AF_INET6;
     } else {
+        int optval = 1;
+        if (netty_unix_socket_setOption0(fd, IPPROTO_IPV6, IPV6_V6ONLY, &optval, sizeof(optval)) < 0) {
+            struct sockaddr_in6 ip6addr;
+
+            memset(&ip6addr, 0, sizeof(struct sockaddr_in6));
+
+            ip6addr.sin6_family = AF_INET6;
+            ip6addr.sin6_port = 0;
+            ip6addr.sin6_addr = in6addr_any;
+
+            // Try to bind ipv6 address as well to be sure it really works.
+            // See https://github.com/netty/netty/issues/7021
+            if (bind(fd, (struct sockaddr*) &ip6addr, sizeof(struct sockaddr_in6)) == -1) {
+                if (errno == EAFNOSUPPORT) {
+                    return AF_INET;
+                }
+                // ignore all the other errno values to be consistent with what we do above.
+            }
+        } else {
+            // ignore errno and just assume AF_INET6
+        }
         close(fd);
         return AF_INET6;
     }
@@ -198,10 +225,6 @@ static void netty_unix_socket_optionHandleError(JNIEnv* env, int err, char* meth
 
 static void netty_unix_socket_setOptionHandleError(JNIEnv* env, int err) {
     netty_unix_socket_optionHandleError(env, err, "setsockopt() failed: ");
-}
-
-static int netty_unix_socket_setOption0(jint fd, int level, int optname, const void* optval, socklen_t len) {
-    return setsockopt(fd, level, optname, optval, len);
 }
 
 static jint _socket(JNIEnv* env, jclass clazz, int type) {
