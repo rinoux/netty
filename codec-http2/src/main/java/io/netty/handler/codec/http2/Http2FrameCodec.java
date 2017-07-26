@@ -301,7 +301,7 @@ public final class Http2FrameCodec extends ChannelDuplexHandler {
         }
     }
 
-    private Http2Connection connection() {
+    public Http2Connection connection() {
         return http2Handler.connection();
     }
 

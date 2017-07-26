@@ -39,7 +39,7 @@ public final class Http2Codec extends ChannelDuplexHandler {
         multiplexCodec = new Http2MultiplexCodec(server, inboundStreamHandler);
     }
 
-    Http2FrameCodec frameCodec() {
+    public Http2FrameCodec frameCodec() {
         return frameCodec;
     }
 
