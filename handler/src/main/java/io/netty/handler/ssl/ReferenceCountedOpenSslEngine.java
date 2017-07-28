@@ -236,56 +236,66 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
         super(peerHost, peerPort);
         OpenSsl.ensureAvailability();
         leak = leakDetection ? leakDetector.track(this) : null;
-        this.alloc = checkNotNull(alloc, "alloc");
-        apn = (OpenSslApplicationProtocolNegotiator) context.applicationProtocolNegotiator();
-        session = new OpenSslSession(context.sessionContext());
-        clientMode = context.isClient();
-        engineMap = context.engineMap;
-        rejectRemoteInitiatedRenegotiation = context.getRejectRemoteInitiatedRenegotiation();
-        localCerts = context.keyCertChain;
-        keyMaterialManager = context.keyMaterialManager();
-        enableOcsp = context.enableOcsp;
-        this.jdkCompatibilityMode = jdkCompatibilityMode;
-        Lock readerLock = context.ctxLock.readLock();
-        readerLock.lock();
-        final long finalSsl;
+        boolean success = false;
         try {
-            finalSsl = SSL.newSSL(context.ctx, !context.isClient());
-        } finally {
-            readerLock.unlock();
-        }
-        synchronized (this) {
-            ssl = finalSsl;
+            clientMode = context.isClient();
+            engineMap = context.engineMap;
+
+            this.alloc = checkNotNull(alloc, "alloc");
+            apn = (OpenSslApplicationProtocolNegotiator) context.applicationProtocolNegotiator();
+            session = new OpenSslSession(context.sessionContext());
+            rejectRemoteInitiatedRenegotiation = context.getRejectRemoteInitiatedRenegotiation();
+            localCerts = context.keyCertChain;
+            keyMaterialManager = context.keyMaterialManager();
+            enableOcsp = context.enableOcsp;
+            this.jdkCompatibilityMode = jdkCompatibilityMode;
+            Lock readerLock = context.ctxLock.readLock();
+            readerLock.lock();
+            final long finalSsl;
             try {
-                networkBIO = SSL.bioNewByteBuffer(ssl, context.getBioNonApplicationBufferSize());
+                finalSsl = SSL.newSSL(context.ctx, !context.isClient());
+            } finally {
+                readerLock.unlock();
+            }
+            synchronized (this) {
+                ssl = finalSsl;
+                try {
+                    networkBIO = SSL.bioNewByteBuffer(ssl, context.getBioNonApplicationBufferSize());
 
-                // Set the client auth mode, this needs to be done via setClientAuth(...) method so we actually call the
-                // needed JNI methods.
-                setClientAuth(clientMode ? ClientAuth.NONE : context.clientAuth);
+                    // Set the client auth mode, this needs to be done via setClientAuth(...) method so we actually
+                    // call the needed JNI methods.
+                    setClientAuth(clientMode ? ClientAuth.NONE : context.clientAuth);
 
-                if (context.protocols != null) {
-                    setEnabledProtocols(context.protocols);
+                    if (context.protocols != null) {
+                        setEnabledProtocols(context.protocols);
+                    }
+
+                    // Use SNI if peerHost was specified
+                    // See https://github.com/netty/netty/issues/4746
+                    if (clientMode && peerHost != null) {
+                        SSL.setTlsExtHostName(ssl, peerHost);
+                    }
+
+                    if (enableOcsp) {
+                        SSL.enableOcsp(ssl);
+                    }
+
+                    if (!jdkCompatibilityMode) {
+                        SSL.setMode(ssl, SSL.getMode(ssl) | SSL.SSL_MODE_ENABLE_PARTIAL_WRITE);
+                    }
+
+                    // setMode may impact the overhead.
+                    calculateMaxWrapOverhead();
+                } catch (Throwable cause) {
+                    PlatformDependent.throwException(cause);
                 }
-
-                // Use SNI if peerHost was specified
-                // See https://github.com/netty/netty/issues/4746
-                if (clientMode && peerHost != null) {
-                    SSL.setTlsExtHostName(ssl, peerHost);
-                }
-
-                if (enableOcsp) {
-                    SSL.enableOcsp(ssl);
-                }
-
-                if (!jdkCompatibilityMode) {
-                    SSL.setMode(ssl, SSL.getMode(ssl) | SSL.SSL_MODE_ENABLE_PARTIAL_WRITE);
-                }
-
-                // setMode may impact the overhead.
-                calculateMaxWrapOverhead();
-            } catch (Throwable cause) {
-                SSL.freeSSL(ssl);
-                PlatformDependent.throwException(cause);
+            }
+            success = true;
+        } finally {
+            if (!success) {
+                // Ensure we call release() when the constructor throws as otherwise we may leak direct memory and
+                // also not close the ReferenceLeak and so produce a leak report.
+                release();
             }
         }
     }
@@ -394,10 +404,11 @@ public class ReferenceCountedOpenSslEngine extends SSLEngine implements Referenc
      */
     public final synchronized void shutdown() {
         if (DESTROYED_UPDATER.compareAndSet(this, 0, 1)) {
-            engineMap.remove(ssl);
-            SSL.freeSSL(ssl);
+            if (ssl != 0) {
+                engineMap.remove(ssl);
+                SSL.freeSSL(ssl);
+            }
             ssl = networkBIO = 0;
-
             isInboundDone = outboundClosed = true;
         }
 
