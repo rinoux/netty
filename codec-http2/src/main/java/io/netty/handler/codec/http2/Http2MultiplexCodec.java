@@ -103,6 +103,74 @@ import static java.lang.Math.min;
 @UnstableApi
 public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
 
+    @SuppressWarnings("rawtypes")
+    private static final AtomicLongFieldUpdater<DefaultHttp2StreamChannel> OUTBOUND_FLOW_CONTROL_WINDOW_UPDATER =
+            AtomicLongFieldUpdater.newUpdater(DefaultHttp2StreamChannel.class, "outboundFlowControlWindow");
+
+    /**
+     * Used by subclasses to queue a close channel within the read queue. When read, it will close
+     * the channel (using Unsafe) instead of notifying handlers of the message with {@code
+     * channelRead()}. Additional inbound messages must not arrive after this one.
+     */
+    private static final Object CLOSE_MESSAGE = new Object();
+    /**
+     * Used to add a message to the {@link ChannelOutboundBuffer}, so as to have it re-evaluate its writability
+     * state.
+     */
+    private static final Object REEVALUATE_WRITABILITY_MESSAGE = new Object();
+    private static final ChannelMetadata METADATA = new ChannelMetadata(false, 16);
+    private static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
+            new ClosedChannelException(), DefaultHttp2StreamChannel.class, "doWrite(...)");
+
+    /**
+     * Number of bytes to consider non-payload messages, to determine when to stop reading. 9 is
+     * arbitrary, but also the minimum size of an HTTP/2 frame. Primarily is non-zero.
+     */
+    private static final int ARBITRARY_MESSAGE_SIZE = 9;
+
+    /**
+     * Returns the flow-control size for DATA frames, and 0 for all other frames.
+     */
+    private static final class FlowControlledFrameSizeEstimator implements MessageSizeEstimator {
+
+        static final FlowControlledFrameSizeEstimator INSTANCE = new FlowControlledFrameSizeEstimator();
+
+        private static final class EstimatorHandle implements MessageSizeEstimator.Handle {
+
+            static final EstimatorHandle INSTANCE = new EstimatorHandle();
+
+            @Override
+            public int size(Object msg) {
+                return msg instanceof Http2DataFrame ? ((Http2DataFrame) msg).flowControlledBytes() : 0;
+            }
+        }
+
+        @Override
+        public Handle newHandle() {
+            return EstimatorHandle.INSTANCE;
+        }
+    }
+
+    private static final class ReturnFlowControlWindowOnFailureListener implements ChannelFutureListener {
+        private final int bytes;
+
+        ReturnFlowControlWindowOnFailureListener(int bytes) {
+            this.bytes = bytes;
+        }
+
+        @Override
+        public void operationComplete(ChannelFuture future) throws Exception {
+            if (!future.isSuccess()) {
+                DefaultHttp2StreamChannel channel = (DefaultHttp2StreamChannel) future.channel();
+                /**
+                 * Return the flow control window of the failed data frame. We expect this code to be rarely
+                 * executed and by implementing it as a window update, we don't have to worry about thread-safety.
+                 */
+                channel.fireChildRead(new DefaultHttp2WindowUpdateFrame(bytes).stream(channel.stream()));
+            }
+        }
+    }
+
     private static final ChannelFutureListener CHILD_CHANNEL_REGISTRATION_LISTENER = new ChannelFutureListener() {
         @Override
         public void operationComplete(ChannelFuture future) throws Exception {
@@ -147,6 +215,9 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
     ChannelHandlerContext ctx;
 
     private int initialOutboundStreamWindow = Http2CodecUtil.DEFAULT_WINDOW_SIZE;
+
+    private boolean inChannelReadComplete;
+    private boolean flushPending;
 
     /**
      * Construct a new handler whose child channels run in a different event loop.
@@ -313,39 +384,38 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
      */
     @Override
     public void channelReadComplete(ChannelHandlerContext ctx) {
-        for (int i = 0; i < channelsToFireChildReadComplete.size(); i++) {
-            DefaultHttp2StreamChannel childChannel = channelsToFireChildReadComplete.get(i);
-            // Clear early in case fireChildReadComplete() causes it to need to be re-processed
-            childChannel.inStreamsToFireChildReadComplete = false;
-            childChannel.fireChildReadComplete();
+        inChannelReadComplete = true;
+
+        try {
+            for (int i = 0; i < channelsToFireChildReadComplete.size(); i++) {
+                DefaultHttp2StreamChannel childChannel = channelsToFireChildReadComplete.get(i);
+                // Clear early in case fireChildReadComplete() causes it to need to be re-processed
+                childChannel.inStreamsToFireChildReadComplete = false;
+                childChannel.fireChildReadComplete();
+            }
+            channelsToFireChildReadComplete.clear();
+        } finally {
+            inChannelReadComplete = false;
+            if (flushPending) {
+                // A flush is pending do it now and so flush all the bytes from all the child channels that are pending.
+                flushPending = false;
+                ctx.flush();
+            }
         }
-        channelsToFireChildReadComplete.clear();
     }
 
-    private static final class DefaultHttp2StreamChannel extends AbstractChannel implements Http2StreamChannel {
+    private void flushFromStreamChannel(boolean force) {
+        if (inChannelReadComplete && !force) {
+            // As we are still in the channelReadComplete(...) method we should just delay the flush if its not forced.
+            // This way we can pick up all bytes from all streams and flush these at once.
+            flushPending = true;
+        } else {
+            flushPending = false;
+            ctx.flush();
+        }
+    }
 
-        @SuppressWarnings("rawtypes")
-        private static final AtomicLongFieldUpdater<DefaultHttp2StreamChannel> OUTBOUND_FLOW_CONTROL_WINDOW_UPDATER;
-
-        /**
-         * Used by subclasses to queue a close channel within the read queue. When read, it will close
-         * the channel (using Unsafe) instead of notifying handlers of the message with {@code
-         * channelRead()}. Additional inbound messages must not arrive after this one.
-         */
-        private static final Object CLOSE_MESSAGE = new Object();
-        /**
-         * Used to add a message to the {@link ChannelOutboundBuffer}, so as to have it re-evaluate its writability
-         * state.
-         */
-        private static final Object REEVALUATE_WRITABILITY_MESSAGE = new Object();
-        private static final ChannelMetadata METADATA = new ChannelMetadata(false, 16);
-        private static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
-                new ClosedChannelException(), DefaultHttp2StreamChannel.class, "doWrite(...)");
-        /**
-         * Number of bytes to consider non-payload messages, to determine when to stop reading. 9 is
-         * arbitrary, but also the minimum size of an HTTP/2 frame. Primarily is non-zero.
-         */
-        private static final int ARBITRARY_MESSAGE_SIZE = 9;
+    private final class DefaultHttp2StreamChannel extends AbstractChannel implements Http2StreamChannel {
 
         private final ChannelHandlerContext ctx;
         private final ChannelFutureListener firstFrameWriteListener;
@@ -371,13 +441,9 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
          * remote peer. The window can become negative if a channel handler ignores the channel's writability. We are
          * using a long so that we realistically don't have to worry about underflow.
          */
+        // Must be package private so we can update it with the AtomicLongFieldUpdater.
         @SuppressWarnings("UnusedDeclaration")
-        private volatile long outboundFlowControlWindow;
-
-        static {
-            OUTBOUND_FLOW_CONTROL_WINDOW_UPDATER = AtomicLongFieldUpdater.newUpdater(
-                    DefaultHttp2StreamChannel.class, "outboundFlowControlWindow");
-        }
+        volatile long outboundFlowControlWindow;
 
         DefaultHttp2StreamChannel(ChannelHandlerContext ctx, Http2FrameStream stream,
                                   ChannelFutureListener firstFrameWriteListener) {
@@ -463,7 +529,8 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
 
             if (!streamClosedWithoutError && isStreamIdValid(stream().id())) {
                 Http2StreamFrame resetFrame = new DefaultHttp2ResetFrame(Http2Error.CANCEL).stream(stream());
-                ctx.writeAndFlush(resetFrame);
+                ctx.write(resetFrame);
+                flushFromStreamChannel(true);
             }
 
             while (!inboundBuffer.isEmpty()) {
@@ -552,7 +619,7 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
                 }
             } finally {
                 // ensure we always flush even if the write loop throws.
-                ctx.flush();
+                flushFromStreamChannel(false);
             }
         }
 
@@ -672,7 +739,7 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
             ctx.write(new DefaultHttp2WindowUpdateFrame(bytes).stream(stream()));
         }
 
-        private static Http2StreamFrame validateStreamFrame(Object msg) {
+        private Http2StreamFrame validateStreamFrame(Object msg) {
             if (!(msg instanceof Http2StreamFrame)) {
                 String msgString = msg.toString();
                 ReferenceCountUtil.release(msg);
@@ -692,29 +759,6 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
             public void connect(final SocketAddress remoteAddress,
                                 SocketAddress localAddress, final ChannelPromise promise) {
                 promise.setFailure(new UnsupportedOperationException());
-            }
-        }
-
-        /**
-         * Returns the flow-control size for DATA frames, and 0 for all other frames.
-         */
-        private static final class FlowControlledFrameSizeEstimator implements MessageSizeEstimator {
-
-            static final FlowControlledFrameSizeEstimator INSTANCE = new FlowControlledFrameSizeEstimator();
-
-            private static final class EstimatorHandle implements MessageSizeEstimator.Handle {
-
-                static final EstimatorHandle INSTANCE = new EstimatorHandle();
-
-                @Override
-                public int size(Object msg) {
-                    return msg instanceof Http2DataFrame ? ((Http2DataFrame) msg).flowControlledBytes() : 0;
-                }
-            }
-
-            @Override
-            public Handle newHandle() {
-                return EstimatorHandle.INSTANCE;
             }
         }
 
@@ -785,26 +829,6 @@ public class Http2MultiplexCodec extends Http2ChannelDuplexHandler {
             @Override
             public ChannelConfig setWriteBufferWaterMark(WriteBufferWaterMark writeBufferWaterMark) {
                 throw new UnsupportedOperationException();
-            }
-        }
-
-        private static final class ReturnFlowControlWindowOnFailureListener implements ChannelFutureListener {
-            private final int bytes;
-
-            ReturnFlowControlWindowOnFailureListener(int bytes) {
-                this.bytes = bytes;
-            }
-
-            @Override
-            public void operationComplete(ChannelFuture future) throws Exception {
-                if (!future.isSuccess()) {
-                    DefaultHttp2StreamChannel channel = (DefaultHttp2StreamChannel) future.channel();
-                    /**
-                     * Return the flow control window of the failed data frame. We expect this code to be rarely
-                     * executed and by implementing it as a window update, we don't have to worry about thread-safety.
-                     */
-                    channel.fireChildRead(new DefaultHttp2WindowUpdateFrame(bytes).stream(channel.stream()));
-                }
             }
         }
     }
