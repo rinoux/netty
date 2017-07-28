@@ -90,11 +90,6 @@ public final class HelloWorldHttp2Handler extends Http2ConnectionHandler impleme
         Http2Headers headers = new DefaultHttp2Headers().status(OK.codeAsText());
         encoder().writeHeaders(ctx, streamId, headers, 0, false, ctx.newPromise());
         encoder().writeData(ctx, streamId, payload, 0, true, ctx.newPromise());
-        try {
-            flush(ctx);
-        } catch (Throwable cause) {
-            onError(ctx, cause);
-        }
     }
 
     @Override

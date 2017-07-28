@@ -62,10 +62,15 @@ public class HelloWorldHttp2Handler extends ChannelDuplexHandler {
         }
     }
 
+    @Override
+    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+        ctx.flush();
+    }
+
     /**
      * If receive a frame with end-of-stream set, send a pre-canned response.
      */
-    public void onDataRead(ChannelHandlerContext ctx, Http2DataFrame data) throws Exception {
+    private static void onDataRead(ChannelHandlerContext ctx, Http2DataFrame data) throws Exception {
         Http2FrameStream stream = data.stream();
 
         if (data.isEndStream()) {
@@ -76,13 +81,13 @@ public class HelloWorldHttp2Handler extends ChannelDuplexHandler {
         }
 
         // Update the flowcontroller
-        ctx.write(new DefaultHttp2WindowUpdateFrame(data.flowControlledBytes()).stream(stream));
+        ctx.write(new DefaultHttp2WindowUpdateFrame(data.flowControlledBytes()).stream(stream), ctx.voidPromise());
     }
 
     /**
      * If receive a frame with end-of-stream set, send a pre-canned response.
      */
-    public void onHeadersRead(ChannelHandlerContext ctx, Http2HeadersFrame headers)
+    private static void onHeadersRead(ChannelHandlerContext ctx, Http2HeadersFrame headers)
             throws Exception {
         if (headers.isEndStream()) {
             ByteBuf content = ctx.alloc().buffer();
@@ -99,6 +104,6 @@ public class HelloWorldHttp2Handler extends ChannelDuplexHandler {
         // Send a frame for the response status
         Http2Headers headers = new DefaultHttp2Headers().status(OK.codeAsText());
         ctx.write(new DefaultHttp2HeadersFrame(headers).stream(stream));
-        ctx.writeAndFlush(new DefaultHttp2DataFrame(payload, true).stream(stream));
+        ctx.write(new DefaultHttp2DataFrame(payload, true).stream(stream));
     }
 }
